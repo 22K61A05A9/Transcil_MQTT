@@ -1,0 +1,31 @@
+# Go build/test files
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# Runtime logs
+logs/*.log
+
+# Mosquitto runtime data
+mosquitto/data/
+mosquitto/log/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE/editor files
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.temp
