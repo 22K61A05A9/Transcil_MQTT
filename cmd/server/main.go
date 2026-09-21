@@ -11,6 +11,7 @@ import (
 
 	paho "github.com/eclipse/paho.mqtt.golang"
 
+	"swap-station-simulator/internal/logger"
 	"swap-station-simulator/internal/mqtt"
 	"swap-station-simulator/internal/protocol"
 )
@@ -19,6 +20,8 @@ type Server struct {
 	mqttClient *mqtt.Client
 	publisher  *mqtt.Publisher
 	subscriber *mqtt.Subscriber
+
+	logger *logger.Logger
 
 	stationCode string
 
@@ -36,27 +39,84 @@ func main() {
 	fmt.Printf("Station : %s\n", stationCode)
 	fmt.Printf("MQTT    : %s\n", brokerURL)
 
+	// --------------------------------------------------
+	// Logger
+	// --------------------------------------------------
+
+	serverLogger, err := logger.New("logs/server.log")
+	if err != nil {
+		fmt.Printf("Logger initialization failed: %v\n", err)
+		return
+	}
+	defer serverLogger.Close()
+
+	serverLogger.Info(
+		"initializing server: station=%s broker=%s",
+		stationCode,
+		brokerURL,
+	)
+
+	// --------------------------------------------------
+	// MQTT
+	// --------------------------------------------------
+
+	// Use a unique client ID so multiple server processes
+	// can connect to the same MQTT broker simultaneously.
+	clientID := fmt.Sprintf(
+		"swap-server-%d",
+		os.Getpid(),
+	)
+
+	serverLogger.Info(
+		"connecting to MQTT broker: broker=%s client_id=%s",
+		brokerURL,
+		clientID,
+	)
+
 	client, err := mqtt.NewClient(mqtt.Config{
 		BrokerURL: brokerURL,
-		ClientID:  "swap-server",
+		ClientID:  clientID,
 	})
 	if err != nil {
-		fmt.Printf("MQTT connection failed: %v\n", err)
+		serverLogger.Error(
+			"MQTT connection failed: %v",
+			err,
+		)
+
+		fmt.Printf(
+			"MQTT connection failed: %v\n",
+			err,
+		)
+
 		return
 	}
 	defer client.Close()
 
+	serverLogger.Info(
+		"MQTT connected successfully: client_id=%s",
+		clientID,
+	)
+
 	publisher := mqtt.NewPublisher(client)
 	subscriber := mqtt.NewSubscriber(client)
+
+	// --------------------------------------------------
+	// Server
+	// --------------------------------------------------
 
 	server := &Server{
 		mqttClient:  client,
 		publisher:   publisher,
 		subscriber:  subscriber,
+		logger:      serverLogger,
 		stationCode: stationCode,
 
 		responseCh: make(chan protocol.Calon02, 1),
 	}
+
+	// --------------------------------------------------
+	// MQTT Subscription
+	// --------------------------------------------------
 
 	ackTopic := mqtt.BMSAckTopic(stationCode)
 
@@ -65,20 +125,54 @@ func main() {
 		server.handleMessage,
 	)
 	if err != nil {
-		fmt.Printf("MQTT subscribe failed: %v\n", err)
+		serverLogger.Error(
+			"MQTT subscription failed: topic=%s error=%v",
+			ackTopic,
+			err,
+		)
+
+		fmt.Printf(
+			"MQTT subscribe failed: %v\n",
+			err,
+		)
+
 		return
 	}
+
+	serverLogger.Info(
+		"subscribed to MQTT topic: %s",
+		ackTopic,
+	)
 
 	fmt.Printf("Listening : %s\n", ackTopic)
 	fmt.Println()
 	fmt.Println("Server started.")
 	fmt.Println()
 
+	serverLogger.Info(
+		"server started: station=%s broker=%s topic=%s",
+		stationCode,
+		brokerURL,
+		ackTopic,
+	)
+
 	ctx := context.Background()
+
+	// --------------------------------------------------
+	// Command Loop
+	// --------------------------------------------------
 
 	for {
 		if err := server.runCommand(ctx); err != nil {
-			fmt.Printf("Command failed: %v\n", err)
+			serverLogger.Error(
+				"command failed: error=%v",
+				err,
+			)
+
+			fmt.Printf(
+				"Command failed: %v\n",
+				err,
+			)
 		}
 
 		fmt.Println()
@@ -89,10 +183,18 @@ func main() {
 	}
 }
 
+// ======================================================
+// RUN SWAP COMMAND
+// ======================================================
+
 func (s *Server) runCommand(ctx context.Context) error {
 	reader := bufio.NewReader(os.Stdin)
 
 	fmt.Println("========== NEW SWAP ==========")
+
+	// --------------------------------------------------
+	// Rider ID
+	// --------------------------------------------------
 
 	riderID, err := readInput(
 		reader,
@@ -101,6 +203,10 @@ func (s *Server) runCommand(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	// --------------------------------------------------
+	// Slot ID
+	// --------------------------------------------------
 
 	slotInput, err := readInput(
 		reader,
@@ -124,6 +230,16 @@ func (s *Server) runCommand(ctx context.Context) error {
 		)
 	}
 
+	s.logger.Info(
+		"swap request received from CLI: rider=%s slot=%d",
+		riderID,
+		slotID,
+	)
+
+	// --------------------------------------------------
+	// Build CALON$11
+	// --------------------------------------------------
+
 	command := protocol.Calon11{
 		Date: time.Now().Format("02012006"),
 		Time: time.Now().Format("150405"),
@@ -143,42 +259,127 @@ func (s *Server) runCommand(ctx context.Context) error {
 
 	payload := protocol.SerializeCalon11(command)
 
+	s.logger.Info(
+		"CALON$11 created: rider=%s slot=%d payload=%s",
+		riderID,
+		slotID,
+		payload,
+	)
+
 	topic := mqtt.BMSAckTopic(s.stationCode)
+
+	// --------------------------------------------------
+	// Display command
+	// --------------------------------------------------
 
 	fmt.Println()
 	fmt.Println("========== SENDING COMMAND ==========")
 	fmt.Printf("Topic   : %s\n", topic)
 	fmt.Printf("Payload : %s\n", payload)
 
+	// --------------------------------------------------
+	// Publish CALON$11
+	// --------------------------------------------------
+
 	if err := s.publisher.Publish(
 		topic,
 		[]byte(payload),
 	); err != nil {
+
+		s.logger.Error(
+			"CALON$11 publish failed: rider=%s slot=%d error=%v",
+			riderID,
+			slotID,
+			err,
+		)
+
 		return fmt.Errorf(
 			"publish CALON$11: %w",
 			err,
 		)
 	}
 
+	s.logger.Info(
+		"CALON$11 published: rider=%s slot=%d topic=%s",
+		riderID,
+		slotID,
+		topic,
+	)
+
 	fmt.Println("Command published successfully.")
 	fmt.Println("Waiting for CALON$02 response...")
 
-	// Wait until the simulator sends CALON$02.
-	select {
-	case response := <-s.responseCh:
-		s.printResponse(response)
+	s.logger.Info(
+		"waiting for CALON$02: rider=%s slot=%d timeout=10s",
+		riderID,
+		slotID,
+	)
 
-		return nil
+	// --------------------------------------------------
+	// Wait for matching CALON$02
+	// --------------------------------------------------
 
-	case <-time.After(10 * time.Second):
-		return fmt.Errorf(
-			"timeout waiting for CALON$02 response",
-		)
+	timeout := time.NewTimer(10 * time.Second)
+	defer timeout.Stop()
 
-	case <-ctx.Done():
-		return ctx.Err()
+	for {
+		select {
+
+		case response := <-s.responseCh:
+
+			// A server should only consume the response
+			// belonging to its current rider.
+			if response.RiderID != riderID {
+				s.logger.Info(
+					"CALON$02 ignored: expected_rider=%s received_rider=%s slot=%d",
+					riderID,
+					response.RiderID,
+					response.SlotID,
+				)
+
+				continue
+			}
+
+			s.logger.Info(
+				"CALON$02 received: rider=%s slot=%d battery=%s",
+				response.RiderID,
+				response.SlotID,
+				response.BatterySerial,
+			)
+
+			s.printResponse(response)
+
+			return nil
+
+		case <-timeout.C:
+
+			s.logger.Error(
+				"CALON$02 timeout: rider=%s slot=%d",
+				riderID,
+				slotID,
+			)
+
+			return fmt.Errorf(
+				"timeout waiting for CALON$02 response",
+			)
+
+		case <-ctx.Done():
+
+			s.logger.Error(
+				"swap command cancelled: rider=%s slot=%d error=%v",
+				riderID,
+				slotID,
+				ctx.Err(),
+			)
+
+			return ctx.Err()
+		}
 	}
 }
+
+// ======================================================
+// MQTT MESSAGE HANDLER
+// ======================================================
 
 func (s *Server) handleMessage(
 	_ paho.Client,
@@ -188,46 +389,114 @@ func (s *Server) handleMessage(
 		string(message.Payload()),
 	)
 
+	s.logger.Info(
+		"MQTT message received: topic=%s payload=%s",
+		message.Topic(),
+		payload,
+	)
+
 	fmt.Println()
 	fmt.Println("========== MQTT MESSAGE ==========")
 	fmt.Printf("Topic   : %s\n", message.Topic())
 	fmt.Printf("Payload : %s\n", payload)
 
-	// The server subscribes to the same topic on which it
-	// publishes CALON$11. Therefore the server can see its
-	// own outgoing CALON$11.
+	// --------------------------------------------------
+	// CALON$11
+	// --------------------------------------------------
+
+	// The server publishes CALON$11 on the same topic
+	// that it subscribes to. Therefore it can receive
+	// its own outgoing command.
 	if strings.Contains(payload, "CALON$11") {
+
 		fmt.Println("Ignoring own CALON$11 command.")
+
+		s.logger.Info(
+			"own CALON$11 ignored: topic=%s",
+			message.Topic(),
+		)
+
 		fmt.Println("===================================")
 		return
 	}
 
+	// --------------------------------------------------
+	// Unknown message
+	// --------------------------------------------------
+
 	if !strings.Contains(payload, "CALON$02") {
+
+		messageType := detectMessageType(payload)
+
 		fmt.Printf(
 			"Ignoring message type: %s\n",
-			detectMessageType(payload),
+			messageType,
 		)
+
+		s.logger.Info(
+			"MQTT message ignored: message_type=%s topic=%s",
+			messageType,
+			message.Topic(),
+		)
+
 		fmt.Println("===================================")
 		return
 	}
+
+	// --------------------------------------------------
+	// Parse CALON$02
+	// --------------------------------------------------
 
 	response, err := protocol.ParseCalon02(payload)
 	if err != nil {
+
 		fmt.Printf(
 			"Failed to parse CALON$02: %v\n",
 			err,
 		)
+
+		s.logger.Error(
+			"CALON$02 parse failed: error=%v payload=%s",
+			err,
+			payload,
+		)
+
 		fmt.Println("===================================")
 		return
 	}
 
-	// Send the parsed response to runCommand().
+	s.logger.Info(
+		"CALON$02 parsed successfully: station=%s rider=%s slot=%d battery=%s",
+		response.Cabinet.StationID,
+		response.RiderID,
+		response.SlotID,
+		response.BatterySerial,
+	)
+
+	// --------------------------------------------------
+	// Send response to runCommand()
+	// --------------------------------------------------
+
 	s.responseCh <- response
 }
+
+// ======================================================
+// PRINT CALON$02 RESPONSE
+// ======================================================
 
 func (s *Server) printResponse(
 	response protocol.Calon02,
 ) {
+	s.logger.Info(
+		"swap response: station=%s rider=%s slot=%d heartbeat_ack=%d swap_state=%d empty_slot=%d",
+		response.Cabinet.StationID,
+		response.RiderID,
+		response.SlotID,
+		response.HeartbeatAck,
+		response.SwapState,
+		response.EmptySlotOpenStatus,
+	)
+
 	fmt.Println()
 	fmt.Println("========== SWAP RESPONSE ==========")
 
@@ -307,6 +576,10 @@ func (s *Server) printResponse(
 	fmt.Println("===================================")
 }
 
+// ======================================================
+// READ CLI INPUT
+// ======================================================
+
 func readInput(
 	reader *bufio.Reader,
 	prompt string,
@@ -329,8 +602,13 @@ func readInput(
 	return value, nil
 }
 
+// ======================================================
+// DETECT MESSAGE TYPE
+// ======================================================
+
 func detectMessageType(payload string) string {
 	switch {
+
 	case strings.Contains(payload, "CALON$01"):
 		return "CALON$01"
 

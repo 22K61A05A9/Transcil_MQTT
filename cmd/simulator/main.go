@@ -13,6 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"swap-station-simulator/internal/heartbeat"
+	"swap-station-simulator/internal/logger"
 	"swap-station-simulator/internal/mqtt"
 	"swap-station-simulator/internal/protocol"
 	"swap-station-simulator/internal/station"
@@ -42,6 +43,11 @@ type Simulator struct {
 	station      *station.Station
 	stateMachine *station.StateMachine
 	publisher    *mqtt.Publisher
+	logger       *logger.Logger
+	// Context used by batteries that leave the station.
+	// When the simulator shuts down, their drain goroutines
+	// also stop.
+	ctx context.Context
 }
 
 func main() {
@@ -66,14 +72,48 @@ func main() {
 	}
 
 	// ------------------------------------------------------------
+	// Create shutdown context
+	// ------------------------------------------------------------
+
+	ctx, cancel := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer cancel()
+	simLogger, err := logger.New(config.Logging.SimulatorFile)
+	if err != nil {
+		fmt.Printf("failed to create simulator logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer simLogger.Close()
+	// ------------------------------------------------------------
 	// Create simulated station
 	// ------------------------------------------------------------
+
+	// Five cabinet slots:
+	//
+	// Slot 1 -> BAT001 -> 95%
+	// Slot 2 -> BAT002 -> 93%
+	// Slot 3 -> BAT003 -> 91%
+	// Slot 4 -> BAT004 -> 60% and charging
+	// Slot 5 -> EMPTY
+	//
+	// InitializeBatteries() creates this state.
 
 	simulatedStation := station.NewStation(
 		config.Station.Code,
 		config.Station.MachineID,
-		3,
+		5,
 	)
+
+	if err := simulatedStation.InitializeBatteries(); err != nil {
+		fmt.Printf(
+			"failed to initialize station batteries: %v\n",
+			err,
+		)
+		os.Exit(1)
+	}
 
 	stateMachine := station.NewStateMachine(simulatedStation)
 
@@ -99,6 +139,8 @@ func main() {
 		station:      simulatedStation,
 		stateMachine: stateMachine,
 		publisher:    publisher,
+		logger:       simLogger,
+		ctx:          ctx,
 	}
 
 	// ------------------------------------------------------------
@@ -132,15 +174,13 @@ func main() {
 	)
 
 	// ------------------------------------------------------------
-	// Graceful shutdown
+	// Start battery charging simulation
 	// ------------------------------------------------------------
 
-	ctx, cancel := signal.NotifyContext(
-		context.Background(),
-		os.Interrupt,
-		syscall.SIGTERM,
-	)
-	defer cancel()
+	// Batteries inside the BSS with ChargeStatus == "1"
+	// increase their SOC by 1% every minute.
+
+	go simulatedStation.StartBatteryCharging(ctx)
 
 	// ------------------------------------------------------------
 	// Startup information
@@ -155,7 +195,23 @@ func main() {
 	fmt.Printf("Heartbeat: %s\n", interval)
 	fmt.Printf("Command  : %s\n", commandTopic)
 	fmt.Println()
+
+	fmt.Println("Initial station state:")
+	printStationState(simulatedStation)
+
+	fmt.Println()
+	fmt.Println("Battery charging simulation: +1% SOC every minute")
+	fmt.Println("Removed battery simulation: -1% SOC every minute")
+	fmt.Println("Swap session: one rider at a time")
+	fmt.Println()
 	fmt.Println("Simulator started.")
+	simLogger.Info(
+		"simulator started: station=%s machine=%s broker=%s heartbeat=%s",
+		config.Station.Code,
+		config.Station.MachineID,
+		config.MQTT.Broker,
+		interval,
+	)
 	fmt.Println("Press Ctrl+C to stop.")
 	fmt.Println()
 
@@ -189,22 +245,40 @@ func (s *Simulator) handleMessage(
 	fmt.Printf("Topic   : %s\n", message.Topic())
 	fmt.Printf("Payload : %s\n", raw)
 
+	s.logger.Info(
+		"MQTT message received: topic=%s payload=%s",
+		message.Topic(),
+		raw,
+	)
+
 	messageType, parsed, err := protocol.Parse(raw)
 	if err != nil {
 		fmt.Printf("Parse error: %v\n", err)
+
+		s.logger.Error(
+			"CALON message parse failed: error=%v payload=%s",
+			err,
+			raw,
+		)
+
 		fmt.Println("==================================")
 		return
 	}
 
 	// We only process CALON$11.
-	// CALON$02 is our response and can come back because
-	// we subscribe to the same MQTT topic.
-
+	//
+	// CALON$02 is the response published by the simulator.
 	if messageType != protocol.MessageCalon11 {
 		fmt.Printf(
 			"Ignoring message type: %s\n",
 			messageType,
 		)
+
+		s.logger.Info(
+			"MQTT message ignored: message_type=%s",
+			messageType,
+		)
+
 		fmt.Println("==================================")
 		return
 	}
@@ -212,6 +286,11 @@ func (s *Simulator) handleMessage(
 	command, ok := parsed.(protocol.Calon11)
 	if !ok {
 		fmt.Println("Parse error: invalid CALON$11 structure")
+
+		s.logger.Error(
+			"invalid CALON$11 structure",
+		)
+
 		fmt.Println("==================================")
 		return
 	}
@@ -224,11 +303,33 @@ func (s *Simulator) handleMessage(
 		command.OpenBatterySlot,
 	)
 
+	s.logger.Info(
+		"CALON$11 received: rider=%s slot=%d swap_state=%d open=%d",
+		command.RiderID,
+		command.SlotID,
+		command.SwapState,
+		command.OpenBatterySlot,
+	)
+
 	if err := s.processCommand(command); err != nil {
-		fmt.Printf("Command error: %v\n", err)
+		fmt.Printf("Command rejected: %v\n", err)
+
+		s.logger.Error(
+			"swap command rejected: rider=%s slot=%d reason=%v",
+			command.RiderID,
+			command.SlotID,
+			err,
+		)
+
 		fmt.Println("==================================")
 		return
 	}
+
+	s.logger.Info(
+		"swap command processed successfully: rider=%s slot=%d",
+		command.RiderID,
+		command.SlotID,
+	)
 
 	fmt.Println("Command processed successfully.")
 	fmt.Println("==================================")
@@ -237,26 +338,34 @@ func (s *Simulator) handleMessage(
 // ============================================================
 // CALON$11 PROCESSING
 // ============================================================
-
+//
+// Complete simulated rider swap:
+//
+//  1. Lock station for rider
+//  2. Find empty slot
+//  3. Open empty slot
+//  4. Receive rider's low battery
+//  5. Seat and lock returned battery
+//  6. Returned battery starts charging
+//  7. Find station battery >= 90%
+//  8. Open charged battery slot
+//  9. Remove charged battery
+//
+// 10. Charged battery leaves station
+// 11. Removed battery starts draining -1%/minute
+// 12. Publish CALON$02
+// 13. Release station
 func (s *Simulator) processCommand(
 	command protocol.Calon11,
 ) error {
+
 	// ------------------------------------------------------------
-	// Validate slot
+	// STEP 0: Validate command
 	// ------------------------------------------------------------
 
-	slot := s.station.GetSlot(command.SlotID)
-
-	if slot == nil {
-		return fmt.Errorf(
-			"slot %d does not exist",
-			command.SlotID,
-		)
+	if command.RiderID == "" {
+		return fmt.Errorf("rider_id is required")
 	}
-
-	// ------------------------------------------------------------
-	// Initial supported return command
-	// ------------------------------------------------------------
 
 	if command.OpenBatterySlot != 1 {
 		return fmt.Errorf(
@@ -265,132 +374,433 @@ func (s *Simulator) processCommand(
 		)
 	}
 
+	// For the currently confirmed simulator flow we expect
+	// swap_state=1 (swap started).
+	if command.SwapState != 1 {
+		return fmt.Errorf(
+			"unsupported swap_state=%d; expected 1",
+			command.SwapState,
+		)
+	}
+
 	// ------------------------------------------------------------
-	// STEP 1: Open slot
+	// STEP 1: Lock station for this rider
 	// ------------------------------------------------------------
 
-	if err := s.stateMachine.OpenSlot(
-		command.SlotID,
-	); err != nil {
+	if err := s.station.BeginSwap(command.RiderID); err != nil {
+		return err
+	}
+
+	s.logger.Info(
+		"swap started: rider=%s station=%s",
+		command.RiderID,
+		s.station.Code,
+	)
+
+	// Always release the station when this swap finishes.
+	defer func() {
+		s.station.EndSwap()
+
+		s.logger.Info(
+			"station released: rider=%s",
+			command.RiderID,
+		)
+	}()
+
+	fmt.Println()
+	fmt.Println("========== SWAP START ==========")
+	fmt.Printf("Rider   : %s\n", command.RiderID)
+	fmt.Println("Station : LOCKED for this rider")
+	fmt.Println("================================")
+
+	// ------------------------------------------------------------
+	// STEP 2: Find empty slot
+	// ------------------------------------------------------------
+
+	emptySlot := s.station.FindEmptySlot()
+
+	if emptySlot == nil {
 		return fmt.Errorf(
-			"open slot %d: %w",
-			command.SlotID,
+			"no empty slot available for returned battery",
+		)
+	}
+
+	emptySlotNumber := emptySlot.Number
+
+	s.logger.Info(
+		"empty slot found: rider=%s slot=%d",
+		command.RiderID,
+		emptySlotNumber,
+	)
+
+	fmt.Printf(
+		"Empty slot found: Slot %d\n",
+		emptySlotNumber,
+	)
+
+	// ------------------------------------------------------------
+	// STEP 3: Open empty slot
+	// ------------------------------------------------------------
+
+	if err := s.stateMachine.OpenSlot(emptySlotNumber); err != nil {
+		s.logger.Error(
+			"failed to open return slot: rider=%s slot=%d error=%v",
+			command.RiderID,
+			emptySlotNumber,
+			err,
+		)
+
+		return fmt.Errorf(
+			"open empty slot %d: %w",
+			emptySlotNumber,
 			err,
 		)
 	}
 
 	s.printSlotState(
-		command.SlotID,
-		"DOOR_OPEN",
+		emptySlotNumber,
+		"DOOR_OPEN_FOR_RETURN",
+	)
+
+	s.logger.Info(
+		"return slot opened: rider=%s slot=%d",
+		command.RiderID,
+		emptySlotNumber,
 	)
 
 	time.Sleep(1 * time.Second)
 
 	// ------------------------------------------------------------
-	// STEP 2: Detect battery
+	// STEP 4: Rider places low battery into empty slot
 	// ------------------------------------------------------------
 
-	battery := createSimulatedBattery(command)
+	returnedBattery := createSimulatedBattery(command)
+
+	s.logger.Info(
+		"returned battery created: rider=%s battery=%s bluetooth=%s soc=%.2f",
+		command.RiderID,
+		returnedBattery.ID,
+		returnedBattery.BluetoothID,
+		returnedBattery.ChargePercentage,
+	)
+
+	fmt.Println()
+	fmt.Printf(
+		"Rider returned battery: %s | SOC=%.2f%%\n",
+		returnedBattery.ID,
+		returnedBattery.ChargePercentage,
+	)
 
 	if err := s.stateMachine.DetectBattery(
-		command.SlotID,
-		battery,
+		emptySlotNumber,
+		returnedBattery,
 	); err != nil {
+		s.logger.Error(
+			"failed to detect returned battery: rider=%s slot=%d battery=%s error=%v",
+			command.RiderID,
+			emptySlotNumber,
+			returnedBattery.ID,
+			err,
+		)
+
 		return fmt.Errorf(
-			"detect battery in slot %d: %w",
-			command.SlotID,
+			"detect returned battery in slot %d: %w",
+			emptySlotNumber,
 			err,
 		)
 	}
 
 	s.printSlotState(
-		command.SlotID,
+		emptySlotNumber,
 		"BATTERY_DETECTED",
 	)
 
+	s.logger.Info(
+		"returned battery detected: rider=%s slot=%d battery=%s",
+		command.RiderID,
+		emptySlotNumber,
+		returnedBattery.ID,
+	)
+
 	time.Sleep(1 * time.Second)
 
 	// ------------------------------------------------------------
-	// STEP 3: Seat battery
+	// STEP 5: Seat returned battery
 	// ------------------------------------------------------------
 
-	if err := s.stateMachine.SeatBattery(
-		command.SlotID,
-	); err != nil {
+	if err := s.stateMachine.SeatBattery(emptySlotNumber); err != nil {
+		s.logger.Error(
+			"failed to seat returned battery: rider=%s slot=%d error=%v",
+			command.RiderID,
+			emptySlotNumber,
+			err,
+		)
+
 		return fmt.Errorf(
-			"seat battery in slot %d: %w",
-			command.SlotID,
+			"seat returned battery in slot %d: %w",
+			emptySlotNumber,
 			err,
 		)
 	}
 
 	s.printSlotState(
-		command.SlotID,
+		emptySlotNumber,
 		"BATTERY_SEATED",
 	)
 
+	s.logger.Info(
+		"returned battery seated: rider=%s slot=%d battery=%s",
+		command.RiderID,
+		emptySlotNumber,
+		returnedBattery.ID,
+	)
+
 	time.Sleep(1 * time.Second)
 
 	// ------------------------------------------------------------
-	// STEP 4: Lock slot
+	// STEP 6: Lock returned battery
 	// ------------------------------------------------------------
 
-	if err := s.stateMachine.LockSlot(
-		command.SlotID,
-	); err != nil {
+	if err := s.stateMachine.LockSlot(emptySlotNumber); err != nil {
+		s.logger.Error(
+			"failed to lock returned battery: rider=%s slot=%d error=%v",
+			command.RiderID,
+			emptySlotNumber,
+			err,
+		)
+
 		return fmt.Errorf(
-			"lock slot %d: %w",
-			command.SlotID,
+			"lock returned battery in slot %d: %w",
+			emptySlotNumber,
 			err,
 		)
 	}
 
 	s.printSlotState(
-		command.SlotID,
-		"LOCKED",
+		emptySlotNumber,
+		"RETURNED_BATTERY_LOCKED",
+	)
+
+	s.logger.Info(
+		"returned battery locked and charging: rider=%s slot=%d battery=%s soc=%.2f",
+		command.RiderID,
+		emptySlotNumber,
+		returnedBattery.ID,
+		returnedBattery.ChargePercentage,
+	)
+
+	fmt.Printf(
+		"Returned battery %s is now charging inside Slot %d\n",
+		returnedBattery.ID,
+		emptySlotNumber,
 	)
 
 	// ------------------------------------------------------------
-	// STEP 5: Build CALON$02
+	// STEP 7: Find charged battery
 	// ------------------------------------------------------------
 
-	response := s.buildCalon02(command)
+	chargedSlot := s.findRequestedOrAvailableChargedSlot(
+		command.SlotID,
+	)
+
+	if chargedSlot == nil {
+		return fmt.Errorf(
+			"no battery with SOC >= 90%% is available",
+		)
+	}
+
+	chargedSlotNumber := chargedSlot.Number
+	chargedBatteryID := chargedSlot.Battery.ID
+	chargedBatterySOC := chargedSlot.Battery.ChargePercentage
+
+	s.logger.Info(
+		"charged battery selected: rider=%s slot=%d battery=%s soc=%.2f",
+		command.RiderID,
+		chargedSlotNumber,
+		chargedBatteryID,
+		chargedBatterySOC,
+	)
+
+	fmt.Println()
+	fmt.Printf(
+		"Charged battery selected: Slot %d -> %s -> SOC=%.2f%%\n",
+		chargedSlotNumber,
+		chargedBatteryID,
+		chargedBatterySOC,
+	)
+
+	// ------------------------------------------------------------
+	// STEP 8: Open charged battery slot
+	// ------------------------------------------------------------
+
+	if err := s.stateMachine.OpenSlot(chargedSlotNumber); err != nil {
+		s.logger.Error(
+			"failed to open charged battery slot: rider=%s slot=%d battery=%s error=%v",
+			command.RiderID,
+			chargedSlotNumber,
+			chargedBatteryID,
+			err,
+		)
+
+		return fmt.Errorf(
+			"open charged battery slot %d: %w",
+			chargedSlotNumber,
+			err,
+		)
+	}
+
+	s.printSlotState(
+		chargedSlotNumber,
+		"CHARGED_BATTERY_DOOR_OPEN",
+	)
+
+	s.logger.Info(
+		"charged battery slot opened: rider=%s slot=%d battery=%s",
+		command.RiderID,
+		chargedSlotNumber,
+		chargedBatteryID,
+	)
+
+	time.Sleep(1 * time.Second)
+
+	// ------------------------------------------------------------
+	// STEP 9: Remove charged battery
+	// ------------------------------------------------------------
+
+	removedBattery, err := s.stateMachine.RemoveBattery(
+		chargedSlotNumber,
+	)
+	if err != nil {
+		s.logger.Error(
+			"failed to remove charged battery: rider=%s slot=%d error=%v",
+			command.RiderID,
+			chargedSlotNumber,
+			err,
+		)
+
+		return fmt.Errorf(
+			"remove charged battery from slot %d: %w",
+			chargedSlotNumber,
+			err,
+		)
+	}
+
+	fmt.Println()
+	fmt.Println("========== BATTERY SWAP ==========")
+	fmt.Printf("Battery given to rider : %s\n", removedBattery.ID)
+	fmt.Printf("Bluetooth ID           : %s\n", removedBattery.BluetoothID)
+	fmt.Printf("Starting SOC           : %.2f%%\n", removedBattery.ChargePercentage)
+	fmt.Printf("Removed from Slot      : %d\n", chargedSlotNumber)
+	fmt.Println("==================================")
+
+	s.logger.Info(
+		"charged battery removed: rider=%s slot=%d battery=%s bluetooth=%s soc=%.2f",
+		command.RiderID,
+		chargedSlotNumber,
+		removedBattery.ID,
+		removedBattery.BluetoothID,
+		removedBattery.ChargePercentage,
+	)
+
+	// ------------------------------------------------------------
+	// STEP 10: Start battery drain
+	// ------------------------------------------------------------
+
+	go s.station.DrainBattery(
+		s.ctx,
+		removedBattery,
+	)
+
+	s.logger.Info(
+		"battery drain started: rider=%s battery=%s soc=%.2f rate=-1%%/minute",
+		command.RiderID,
+		removedBattery.ID,
+		removedBattery.ChargePercentage,
+	)
+
+	fmt.Printf(
+		"Battery %s is now outside BSS.\n",
+		removedBattery.ID,
+	)
+	fmt.Println("Battery drain simulation: -1% SOC every minute")
+
+	// ------------------------------------------------------------
+	// STEP 11: Build CALON$02
+	// ------------------------------------------------------------
+
+	responseCommand := command
+	responseCommand.SlotID = chargedSlotNumber
+
+	response := s.buildCalon02(responseCommand)
 
 	payload, err := protocol.SerializeCalon02(response)
 	if err != nil {
+		s.logger.Error(
+			"failed to serialize CALON$02: rider=%s error=%v",
+			command.RiderID,
+			err,
+		)
+
 		return fmt.Errorf(
 			"serialize CALON$02: %w",
 			err,
 		)
 	}
 
-	// Real response format:
+	// Real station response format:
 	//
 	// ACK,CALON$02,...
-	//
-
 	wrappedPayload := "ACK," + payload
 
 	topic := mqtt.BMSAckTopic(
 		s.station.Code,
 	)
 
+	// ------------------------------------------------------------
+	// STEP 11A: Publish CALON$02
+	// ------------------------------------------------------------
+
 	if err := s.publisher.Publish(
 		topic,
 		[]byte(wrappedPayload),
 	); err != nil {
+		s.logger.Error(
+			"failed to publish CALON$02: rider=%s topic=%s error=%v",
+			command.RiderID,
+			topic,
+			err,
+		)
+
 		return fmt.Errorf(
 			"publish CALON$02: %w",
 			err,
 		)
 	}
 
+	s.logger.Info(
+		"CALON$02 published: rider=%s slot=%d battery_given=%s topic=%s",
+		command.RiderID,
+		chargedSlotNumber,
+		removedBattery.ID,
+		topic,
+	)
+
+	// ------------------------------------------------------------
+	// STEP 12: Swap complete
+	// ------------------------------------------------------------
+
 	fmt.Println()
 	fmt.Println("========== SWAP COMPLETE ==========")
-	fmt.Printf("Station : %s\n", s.station.Code)
-	fmt.Printf("Slot    : %d\n", command.SlotID)
-	fmt.Printf("Battery : %s\n", battery.ID)
-	fmt.Println("State   : LOCKED")
+	fmt.Printf("Rider          : %s\n", command.RiderID)
+	fmt.Printf("Returned       : %s\n", returnedBattery.ID)
+	fmt.Printf("Returned slot  : %d\n", emptySlotNumber)
+	fmt.Printf("Given to rider : %s\n", removedBattery.ID)
+	fmt.Printf("Charged slot   : %d\n", chargedSlotNumber)
+	fmt.Printf(
+		"Given battery SOC: %.2f%%\n",
+		removedBattery.ChargePercentage,
+	)
+	fmt.Println("Station        : READY")
 	fmt.Println("===================================")
 
 	fmt.Printf(
@@ -398,16 +808,72 @@ func (s *Simulator) processCommand(
 		wrappedPayload,
 	)
 
+	s.logger.Info(
+		"swap completed: rider=%s returned=%s returned_slot=%d given=%s charged_slot=%d soc=%.2f",
+		command.RiderID,
+		returnedBattery.ID,
+		emptySlotNumber,
+		removedBattery.ID,
+		chargedSlotNumber,
+		removedBattery.ChargePercentage,
+	)
+
 	return nil
+}
+
+// ============================================================
+// FIND CHARGED BATTERY
+// ============================================================
+//
+// If CALON$11 specifies a slot containing a battery >= 90%,
+// use that slot.
+//
+// Otherwise find any available battery >= 90%.
+//
+// This lets the simulator support both:
+//   - explicitly requested charged slot
+//   - automatic charged-battery selection
+func (s *Simulator) findRequestedOrAvailableChargedSlot(
+	requestedSlotNumber int,
+) *station.Slot {
+
+	if requestedSlotNumber >= 1 {
+		requestedSlot := s.station.GetSlot(
+			requestedSlotNumber,
+		)
+
+		if requestedSlot != nil &&
+			requestedSlot.Battery != nil &&
+			requestedSlot.State == station.SlotLocked &&
+			requestedSlot.Occupied &&
+			requestedSlot.Battery.ChargePercentage >= 90 {
+
+			return requestedSlot
+		}
+	}
+
+	return s.station.FindChargedBatterySlot()
 }
 
 // ============================================================
 // CREATE SIMULATED BATTERY
 // ============================================================
-
+//
+// This represents the low battery that the rider brings
+// back to the station.
+//
+// Default SOC = 80%
+// ChargeStatus = 1
+//
+// Therefore, once it is locked into the BSS:
+//
+// 80 -> 81 -> 82 -> ...
+//
+// +1% every minute.
 func createSimulatedBattery(
 	command protocol.Calon11,
 ) *station.Battery {
+
 	batteryID := command.BatterySerial
 
 	if batteryID == "" || batteryID == "0" {
@@ -430,9 +896,8 @@ func createSimulatedBattery(
 		ID:          batteryID,
 		BluetoothID: bluetoothID,
 
-		TotalVoltage: 520.00,
-		TotalCurrent: 10.00,
-
+		TotalVoltage:     520.00,
+		TotalCurrent:     10.00,
 		ChargePercentage: 80.00,
 		HealthPercentage: 95.00,
 		UsableCapacity:   40.00,
@@ -449,11 +914,42 @@ func createSimulatedBattery(
 
 		Alarm: "0",
 
-		ChargeStatus: "0",
+		// Returned battery starts charging once it is
+		// inserted and locked into the station.
+		ChargeStatus: "1",
 
 		ChargingVoltage: 520.00,
 		ChargingCurrent: 10.00,
 		ChargingAlarm:   "0",
+	}
+}
+
+// ============================================================
+// PRINT STATION STATE
+// ============================================================
+
+func printStationState(
+	s *station.Station,
+) {
+	snapshot := s.Snapshot()
+
+	for _, slot := range snapshot.Slots {
+		if slot.Battery == nil {
+			fmt.Printf(
+				"  Slot %d -> EMPTY\n",
+				slot.Number,
+			)
+			continue
+		}
+
+		fmt.Printf(
+			"  Slot %d -> %s | SOC=%.2f%% | charger=%s | state=%s\n",
+			slot.Number,
+			slot.Battery.ID,
+			slot.Battery.ChargePercentage,
+			slot.Battery.ChargeStatus,
+			slot.State,
+		)
 	}
 }
 
@@ -498,9 +994,79 @@ func batteryID(
 func (s *Simulator) buildCalon02(
 	command protocol.Calon11,
 ) protocol.Calon02 {
+
 	snapshot := s.station.Snapshot()
 
+	// Safety check.
+	if command.SlotID < 1 ||
+		command.SlotID > len(snapshot.Slots) {
+		return protocol.Calon02{
+			Cabinet: protocol.CabinetStatus{
+				Date:          time.Now().Format("02012006"),
+				Time:          time.Now().Format("150405"),
+				StationID:     snapshot.Code,
+				MachineID:     snapshot.MachineID,
+				FireSense:     snapshot.FireSensor,
+				Power:         snapshot.Power,
+				Temp:          snapshot.Temperature,
+				WaterLevel:    snapshot.WaterLevel,
+				PhaseReadings: snapshot.PhaseReadings,
+				GSMSignal:     snapshot.SignalStrength,
+				SlotCount:     len(snapshot.Slots),
+			},
+
+			RiderID:             command.RiderID,
+			SlotID:              0,
+			BatterySerial:       "0",
+			BluetoothID:         "0",
+			HeartbeatAck:        0,
+			SwapState:           0,
+			EmptySlotOpenStatus: 0,
+			Buzzer:              0,
+
+			Slot: protocol.SlotStatus{
+				SlotID:            "0",
+				DoorStatus:        "0",
+				CabinetTemp:       "25",
+				CabinetOnline:     "1",
+				SlotOccupancy:     "0",
+				DoorMalfunction:   "0",
+				BatterySerial:     "0",
+				BluetoothID:       "0",
+				TotalVoltage:      "0",
+				TotalCurrent:      "0",
+				SOC:               "0",
+				SOH:               "0",
+				RemainingCapacity: "0",
+				CellTemp:          "0",
+				CFETStatus:        "0",
+				DFETStatus:        "0",
+				MaxCellVoltage:    "0",
+				MinCellVoltage:    "0",
+				MaxCellTemp:       "0",
+				MinCellTemp:       "0",
+				BMSAlarms:         "0",
+				ChargerStatus:     "0",
+				ChargingVoltage:   "0",
+				ChargingCurrent:   "0",
+				ChargerAlarms:     "0",
+			},
+		}
+	}
+
 	slot := snapshot.Slots[command.SlotID-1]
+
+	// Use the actual battery currently in the selected slot.
+	//
+	// After the charged battery has been removed, this will
+	// normally be "0", because the slot is now empty.
+	batterySerial := "0"
+	bluetoothID := "0"
+
+	if slot.Battery != nil {
+		batterySerial = slot.Battery.ID
+		bluetoothID = slot.Battery.BluetoothID
+	}
 
 	return protocol.Calon02{
 		Cabinet: protocol.CabinetStatus{
@@ -519,9 +1085,10 @@ func (s *Simulator) buildCalon02(
 
 		RiderID:       command.RiderID,
 		SlotID:        command.SlotID,
-		BatterySerial: command.BatterySerial,
-		BluetoothID:   command.BluetoothID,
+		BatterySerial: batterySerial,
+		BluetoothID:   bluetoothID,
 
+		// Confirmed successful command behavior.
 		HeartbeatAck: 1,
 		SwapState:    command.SwapState,
 
@@ -540,6 +1107,7 @@ func (s *Simulator) buildCalon02(
 func buildResponseSlot(
 	slot station.Slot,
 ) protocol.SlotStatus {
+
 	status := protocol.SlotStatus{
 		SlotID:          strconv.Itoa(slot.Number),
 		DoorStatus:      boolToIntString(slot.DoorOpen),

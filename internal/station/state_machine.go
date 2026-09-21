@@ -1,4 +1,6 @@
-// we'll create the component responsible for changing physical state.
+// This component is responsible for changing the physical state
+// of the battery swapping station.
+
 package station
 
 import "fmt"
@@ -13,6 +15,17 @@ func NewStateMachine(station *Station) *StateMachine {
 	}
 }
 
+// OpenSlot opens a cabinet slot.
+//
+// Valid transitions:
+//
+//	EMPTY  -> DOOR_OPEN
+//	LOCKED -> DOOR_OPEN
+//
+// The LOCKED -> DOOR_OPEN transition is required when a rider
+// wants to remove the currently installed battery.
+//
+// Other states cannot be opened directly.
 func (sm *StateMachine) OpenSlot(slotNumber int) error {
 	sm.station.mu.Lock()
 	defer sm.station.mu.Unlock()
@@ -26,12 +39,19 @@ func (sm *StateMachine) OpenSlot(slotNumber int) error {
 		)
 	}
 
-	// A slot should not be opened if it is already occupied
-	// and locked.
-	if slot.State == SlotLocked {
+	if slot.DoorOpen {
 		return fmt.Errorf(
-			"slot %d is already locked with a battery",
+			"slot %d door is already open",
 			slotNumber,
+		)
+	}
+
+	if slot.State != SlotEmpty &&
+		slot.State != SlotLocked {
+		return fmt.Errorf(
+			"slot %d cannot be opened from state %s",
+			slotNumber,
+			slot.State,
 		)
 	}
 
@@ -41,6 +61,9 @@ func (sm *StateMachine) OpenSlot(slotNumber int) error {
 	return nil
 }
 
+// DetectBattery places a battery into an open slot.
+//
+//	DOOR_OPEN -> BATTERY_DETECTED
 func (sm *StateMachine) DetectBattery(
 	slotNumber int,
 	battery *Battery,
@@ -85,6 +108,10 @@ func (sm *StateMachine) DetectBattery(
 	return nil
 }
 
+// SeatBattery confirms that the battery has been properly
+// placed inside the slot.
+//
+//	BATTERY_DETECTED -> BATTERY_SEATED
 func (sm *StateMachine) SeatBattery(
 	slotNumber int,
 ) error {
@@ -119,6 +146,9 @@ func (sm *StateMachine) SeatBattery(
 	return nil
 }
 
+// LockSlot closes and locks a slot containing a battery.
+//
+//	BATTERY_SEATED -> LOCKED
 func (sm *StateMachine) LockSlot(
 	slotNumber int,
 ) error {
@@ -153,4 +183,50 @@ func (sm *StateMachine) LockSlot(
 	slot.Occupied = true
 
 	return nil
+}
+
+// RemoveBattery removes the currently installed battery
+// from an open slot.
+//
+//	DOOR_OPEN -> EMPTY
+//
+// The returned Battery object represents the battery that
+// has been physically removed from the cabinet.
+func (sm *StateMachine) RemoveBattery(
+	slotNumber int,
+) (*Battery, error) {
+	sm.station.mu.Lock()
+	defer sm.station.mu.Unlock()
+
+	slot := sm.station.getSlot(slotNumber)
+
+	if slot == nil {
+		return nil, fmt.Errorf(
+			"slot %d does not exist",
+			slotNumber,
+		)
+	}
+
+	if slot.Battery == nil {
+		return nil, fmt.Errorf(
+			"slot %d has no battery",
+			slotNumber,
+		)
+	}
+
+	if !slot.DoorOpen {
+		return nil, fmt.Errorf(
+			"slot %d door is not open",
+			slotNumber,
+		)
+	}
+
+	removedBattery := slot.Battery
+
+	slot.Battery = nil
+	slot.Occupied = false
+	slot.State = SlotEmpty
+	slot.DoorOpen = false
+
+	return removedBattery, nil
 }
