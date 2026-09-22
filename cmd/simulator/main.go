@@ -295,18 +295,23 @@ func (s *Simulator) handleMessage(
 		return
 	}
 
+	requestedSlot := "automatic"
+	if command.SlotID > 0 {
+		requestedSlot = strconv.Itoa(command.SlotID)
+	}
+
 	fmt.Printf(
-		"CALON$11 received: rider=%s slot=%d swap_state=%d open=%d\n",
+		"CALON$11 received: rider=%s requested_slot=%s swap_state=%d open=%d\n",
 		command.RiderID,
-		command.SlotID,
+		requestedSlot,
 		command.SwapState,
 		command.OpenBatterySlot,
 	)
 
 	s.logger.Info(
-		"CALON$11 received: rider=%s slot=%d swap_state=%d open=%d",
+		"CALON$11 received: rider=%s requested_slot=%s swap_state=%d open=%d",
 		command.RiderID,
-		command.SlotID,
+		requestedSlot,
 		command.SwapState,
 		command.OpenBatterySlot,
 	)
@@ -315,24 +320,110 @@ func (s *Simulator) handleMessage(
 		fmt.Printf("Command rejected: %v\n", err)
 
 		s.logger.Error(
-			"swap command rejected: rider=%s slot=%d reason=%v",
+			"swap command rejected: rider=%s requested_slot=%d reason=%v",
 			command.RiderID,
 			command.SlotID,
 			err,
 		)
+
+		// Send an immediate application-level failure response
+		// so the server does not wait for the 10-second timeout.
+		if responseErr := s.publishFailureResponse(command, err); responseErr != nil {
+			fmt.Printf("Failed to publish rejection response: %v\n", responseErr)
+
+			s.logger.Error(
+				"failure CALON$02 publish failed: rider=%s error=%v",
+				command.RiderID,
+				responseErr,
+			)
+		}
 
 		fmt.Println("==================================")
 		return
 	}
 
 	s.logger.Info(
-		"swap command processed successfully: rider=%s slot=%d",
+		"swap command processed successfully: rider=%s requested_slot=%d",
 		command.RiderID,
 		command.SlotID,
 	)
 
 	fmt.Println("Command processed successfully.")
 	fmt.Println("==================================")
+}
+
+// ============================================================
+// PUBLISH FAILURE CALON$02
+// ============================================================
+//
+// This is an application-level simulator response used when
+// a swap cannot be completed, for example:
+//   - no empty slot is available for the returned battery
+//   - no battery with SOC >= 90% is available
+//
+// The confirmed CALON$02 protocol does not define a dedicated
+// failure-reason field. The reason is therefore logged locally.
+// The response uses SlotID=0 and zeroed result flags.
+func (s *Simulator) publishFailureResponse(
+	command protocol.Calon11,
+	reason error,
+) error {
+	snapshot := s.station.Snapshot()
+
+	responseCommand := command
+	responseCommand.SlotID = 0
+
+	// buildCalon02() intentionally returns the protocol failure
+	// structure when SlotID is 0.
+	response := s.buildCalon02(responseCommand)
+
+	response.RiderID = command.RiderID
+	response.SlotID = 0
+	response.BatterySerial = "0"
+	response.BluetoothID = "0"
+	response.HeartbeatAck = 0
+	response.SwapState = 0
+	response.EmptySlotOpenStatus = 0
+	response.Buzzer = 0
+
+	// Keep current cabinet information in the failure response.
+	response.Cabinet.StationID = snapshot.Code
+	response.Cabinet.MachineID = snapshot.MachineID
+	response.Cabinet.FireSense = snapshot.FireSensor
+	response.Cabinet.Power = snapshot.Power
+	response.Cabinet.Temp = snapshot.Temperature
+	response.Cabinet.WaterLevel = snapshot.WaterLevel
+	response.Cabinet.PhaseReadings = snapshot.PhaseReadings
+	response.Cabinet.GSMSignal = snapshot.SignalStrength
+	response.Cabinet.SlotCount = len(snapshot.Slots)
+
+	payload, err := protocol.SerializeCalon02(response)
+	if err != nil {
+		return fmt.Errorf("serialize failure CALON$02: %w", err)
+	}
+
+	wrappedPayload := "ACK," + payload
+	topic := mqtt.BMSAckTopic(s.station.Code)
+
+	if err := s.publisher.Publish(topic, []byte(wrappedPayload)); err != nil {
+		return fmt.Errorf("publish failure CALON$02: %w", err)
+	}
+
+	fmt.Println()
+	fmt.Println("========== SWAP REJECTED RESPONSE ==========")
+	fmt.Printf("Rider  : %s\n", command.RiderID)
+	fmt.Printf("Reason : %v\n", reason)
+	fmt.Println("CALON$02 failure response published.")
+	fmt.Println("============================================")
+
+	s.logger.Info(
+		"failure CALON$02 published: rider=%s reason=%v topic=%s",
+		command.RiderID,
+		reason,
+		topic,
+	)
+
+	return nil
 }
 
 // ============================================================
@@ -365,6 +456,16 @@ func (s *Simulator) processCommand(
 
 	if command.RiderID == "" {
 		return fmt.Errorf("rider_id is required")
+	}
+
+	// SlotID == 0 means automatic charged-battery selection.
+	// A positive SlotID is still supported for protocol/testing
+	// purposes, but the normal server flow sends 0.
+	if command.SlotID < 0 {
+		return fmt.Errorf(
+			"invalid slot_id=%d",
+			command.SlotID,
+		)
 	}
 
 	if command.OpenBatterySlot != 1 {
@@ -414,28 +515,76 @@ func (s *Simulator) processCommand(
 	fmt.Println("================================")
 
 	// ------------------------------------------------------------
-	// STEP 2: Find empty slot
+	// STEP 2: PRE-CHECK SWAP REQUIREMENTS
+	// ------------------------------------------------------------
+	//
+	// IMPORTANT:
+	// We must check BOTH requirements before opening the
+	// return slot or accepting the rider's battery.
+	//
+	// Requirement 1:
+	//   There must be an empty slot for the returned battery.
+	//
+	// Requirement 2:
+	//   There must be a station battery with SOC >= 90%
+	//   available to give to the rider.
+	//
+	// This prevents the station from accepting a returned
+	// battery and then discovering that it cannot provide
+	// a charged battery.
 	// ------------------------------------------------------------
 
 	emptySlot := s.station.FindEmptySlot()
 
 	if emptySlot == nil {
+		s.logger.Error(
+			"swap pre-check failed: rider=%s reason=no empty slot available",
+			command.RiderID,
+		)
+
 		return fmt.Errorf(
 			"no empty slot available for returned battery",
 		)
 	}
 
+	// Select the charged battery BEFORE accepting the returned
+	// battery. There is no concurrency with another swap because
+	// BeginSwap() has already locked the station for this rider.
+	chargedSlot := s.findRequestedOrAvailableChargedSlot(
+		command.SlotID,
+	)
+
+	if chargedSlot == nil {
+		s.logger.Error(
+			"swap pre-check failed: rider=%s reason=no battery with SOC >= 90%%",
+			command.RiderID,
+		)
+
+		return fmt.Errorf(
+			"no battery with SOC >= 90%% is available",
+		)
+	}
+
 	emptySlotNumber := emptySlot.Number
+	chargedSlotNumber := chargedSlot.Number
+	chargedBatteryID := chargedSlot.Battery.ID
+	chargedBatterySOC := chargedSlot.Battery.ChargePercentage
 
 	s.logger.Info(
-		"empty slot found: rider=%s slot=%d",
+		"swap pre-check passed: rider=%s return_slot=%d charged_slot=%d battery=%s soc=%.2f",
 		command.RiderID,
 		emptySlotNumber,
+		chargedSlotNumber,
+		chargedBatteryID,
+		chargedBatterySOC,
 	)
 
 	fmt.Printf(
-		"Empty slot found: Slot %d\n",
+		"Swap pre-check passed: return slot=%d | charged slot=%d | battery=%s | SOC=%.2f%%\n",
 		emptySlotNumber,
+		chargedSlotNumber,
+		chargedBatteryID,
+		chargedBatterySOC,
 	)
 
 	// ------------------------------------------------------------
@@ -596,22 +745,28 @@ func (s *Simulator) processCommand(
 	)
 
 	// ------------------------------------------------------------
-	// STEP 7: Find charged battery
+	// STEP 7: Use the charged battery selected during pre-check
 	// ------------------------------------------------------------
 
-	chargedSlot := s.findRequestedOrAvailableChargedSlot(
-		command.SlotID,
-	)
+	// Re-read the slot so we use the current station state.
+	// The station is still locked for this rider, so no other
+	// swap can modify this slot.
+	chargedSlot = s.station.GetSlot(chargedSlotNumber)
 
-	if chargedSlot == nil {
+	if chargedSlot == nil ||
+		chargedSlot.Battery == nil ||
+		chargedSlot.State != station.SlotLocked ||
+		!chargedSlot.Occupied ||
+		chargedSlot.Battery.ChargePercentage < 90 {
+
 		return fmt.Errorf(
-			"no battery with SOC >= 90%% is available",
+			"selected charged battery is no longer available: slot=%d",
+			chargedSlotNumber,
 		)
 	}
 
-	chargedSlotNumber := chargedSlot.Number
-	chargedBatteryID := chargedSlot.Battery.ID
-	chargedBatterySOC := chargedSlot.Battery.ChargePercentage
+	chargedBatteryID = chargedSlot.Battery.ID
+	chargedBatterySOC = chargedSlot.Battery.ChargePercentage
 
 	s.logger.Info(
 		"charged battery selected: rider=%s slot=%d battery=%s soc=%.2f",
@@ -825,14 +980,14 @@ func (s *Simulator) processCommand(
 // FIND CHARGED BATTERY
 // ============================================================
 //
-// If CALON$11 specifies a slot containing a battery >= 90%,
-// use that slot.
+// If CALON$11 specifies a slot >= 1, use that slot only when
+// it contains a locked battery with SOC >= 90%.
 //
-// Otherwise find any available battery >= 90%.
+// If SlotID == 0, the server is asking the simulator to
+// automatically select an available charged battery.
 //
-// This lets the simulator support both:
-//   - explicitly requested charged slot
-//   - automatic charged-battery selection
+// SlotID == 0 is an application-level simulator convention.
+// It is not being introduced as a new CALON protocol value.
 func (s *Simulator) findRequestedOrAvailableChargedSlot(
 	requestedSlotNumber int,
 ) *station.Slot {
@@ -877,9 +1032,13 @@ func createSimulatedBattery(
 	batteryID := command.BatterySerial
 
 	if batteryID == "" || batteryID == "0" {
+		// The server no longer asks the rider to select a slot,
+		// so SlotID is 0 for automatic selection.
+		// Use the rider ID to create a readable simulated
+		// battery identity instead of generating SIMBAT000.
 		batteryID = fmt.Sprintf(
-			"SIMBAT%03d",
-			command.SlotID,
+			"SIMBAT-%s",
+			command.RiderID,
 		)
 	}
 
@@ -887,8 +1046,8 @@ func createSimulatedBattery(
 
 	if bluetoothID == "" || bluetoothID == "0" {
 		bluetoothID = fmt.Sprintf(
-			"SIMBT%03d",
-			command.SlotID,
+			"SIMBT-%s",
+			command.RiderID,
 		)
 	}
 

@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -204,36 +203,9 @@ func (s *Server) runCommand(ctx context.Context) error {
 		return err
 	}
 
-	// --------------------------------------------------
-	// Slot ID
-	// --------------------------------------------------
-
-	slotInput, err := readInput(
-		reader,
-		"Slot ID: ",
-	)
-	if err != nil {
-		return err
-	}
-
-	slotID, err := strconv.Atoi(slotInput)
-	if err != nil {
-		return fmt.Errorf(
-			"invalid slot ID %q",
-			slotInput,
-		)
-	}
-
-	if slotID < 1 {
-		return fmt.Errorf(
-			"slot ID must be greater than zero",
-		)
-	}
-
 	s.logger.Info(
-		"swap request received from CLI: rider=%s slot=%d",
+		"swap request received from CLI: rider=%s",
 		riderID,
-		slotID,
 	)
 
 	// --------------------------------------------------
@@ -246,7 +218,11 @@ func (s *Server) runCommand(ctx context.Context) error {
 
 		RiderID: riderID,
 
-		SlotID: slotID,
+		// SlotID = 0 means that the simulator should
+		// automatically select an available charged battery.
+		//
+		// The user does NOT select a slot.
+		SlotID: 0,
 
 		BatterySerial: "0",
 		BluetoothID:   "0",
@@ -260,9 +236,8 @@ func (s *Server) runCommand(ctx context.Context) error {
 	payload := protocol.SerializeCalon11(command)
 
 	s.logger.Info(
-		"CALON$11 created: rider=%s slot=%d payload=%s",
+		"CALON$11 created: rider=%s slot=automatic payload=%s",
 		riderID,
-		slotID,
 		payload,
 	)
 
@@ -287,9 +262,8 @@ func (s *Server) runCommand(ctx context.Context) error {
 	); err != nil {
 
 		s.logger.Error(
-			"CALON$11 publish failed: rider=%s slot=%d error=%v",
+			"CALON$11 publish failed: rider=%s error=%v",
 			riderID,
-			slotID,
 			err,
 		)
 
@@ -300,9 +274,8 @@ func (s *Server) runCommand(ctx context.Context) error {
 	}
 
 	s.logger.Info(
-		"CALON$11 published: rider=%s slot=%d topic=%s",
+		"CALON$11 published: rider=%s topic=%s",
 		riderID,
-		slotID,
 		topic,
 	)
 
@@ -310,9 +283,8 @@ func (s *Server) runCommand(ctx context.Context) error {
 	fmt.Println("Waiting for CALON$02 response...")
 
 	s.logger.Info(
-		"waiting for CALON$02: rider=%s slot=%d timeout=10s",
+		"waiting for CALON$02: rider=%s timeout=10s",
 		riderID,
-		slotID,
 	)
 
 	// --------------------------------------------------
@@ -341,22 +313,60 @@ func (s *Server) runCommand(ctx context.Context) error {
 			}
 
 			s.logger.Info(
-				"CALON$02 received: rider=%s slot=%d battery=%s",
+				"CALON$02 received: rider=%s slot=%d battery=%s heartbeat_ack=%d swap_state=%d",
+				response.RiderID,
+				response.SlotID,
+				response.BatterySerial,
+				response.HeartbeatAck,
+				response.SwapState,
+			)
+
+			// HeartbeatAck=0 or SwapState=0 is treated as an
+			// application-level rejected swap response.
+			// The confirmed CALON protocol does not define
+			// a dedicated operational rejection reason field.
+			if response.HeartbeatAck == 0 || response.SwapState == 0 {
+				s.printResponse(response)
+
+				fmt.Println()
+				fmt.Println("========== SWAP REJECTED ==========")
+				fmt.Printf("Rider : %s\n", response.RiderID)
+				fmt.Println("Reason: Station could not complete the swap.")
+				fmt.Println("===================================")
+
+				s.logger.Info(
+					"swap rejected: rider=%s heartbeat_ack=%d swap_state=%d",
+					response.RiderID,
+					response.HeartbeatAck,
+					response.SwapState,
+				)
+
+				return nil
+			}
+
+			// Successful swap response.
+			s.printResponse(response)
+
+			fmt.Println()
+			fmt.Println("========== SWAP SUCCESSFUL ==========")
+			fmt.Printf("Rider : %s\n", response.RiderID)
+			fmt.Println("Station completed the battery swap.")
+			fmt.Println("=====================================")
+
+			s.logger.Info(
+				"swap successful: rider=%s slot=%d battery=%s",
 				response.RiderID,
 				response.SlotID,
 				response.BatterySerial,
 			)
-
-			s.printResponse(response)
 
 			return nil
 
 		case <-timeout.C:
 
 			s.logger.Error(
-				"CALON$02 timeout: rider=%s slot=%d",
+				"CALON$02 timeout: rider=%s",
 				riderID,
-				slotID,
 			)
 
 			return fmt.Errorf(
@@ -366,9 +376,8 @@ func (s *Server) runCommand(ctx context.Context) error {
 		case <-ctx.Done():
 
 			s.logger.Error(
-				"swap command cancelled: rider=%s slot=%d error=%v",
+				"swap command cancelled: rider=%s error=%v",
 				riderID,
-				slotID,
 				ctx.Err(),
 			)
 
@@ -405,8 +414,8 @@ func (s *Server) handleMessage(
 	// --------------------------------------------------
 
 	// The server publishes CALON$11 on the same topic
-	// that it subscribes to. Therefore it can receive
-	// its own outgoing command.
+	// that it subscribes to. Therefore the server can
+	// receive its own outgoing command.
 	if strings.Contains(payload, "CALON$11") {
 
 		fmt.Println("Ignoring own CALON$11 command.")
@@ -510,6 +519,8 @@ func (s *Server) printResponse(
 		response.RiderID,
 	)
 
+	// This is the slot actually selected by the station.
+	// It is NOT entered by the user.
 	fmt.Printf(
 		"Slot          : %d\n",
 		response.SlotID,
